@@ -13,6 +13,7 @@ except ImportError:
     from functools32 import lru_cache
 
 import joblib
+import lru
 import numpy as np
 import pandas as pd
 import tqdm
@@ -114,7 +115,8 @@ class SpectralLibraryReader(object):
     Read spectra from a spectral library file.
     """
 
-    _max_cache_size = None
+    _max_cache_size = 2**16
+    _cache = lru.LRU(_max_cache_size)
 
     _supported_extensions = []
 
@@ -188,14 +190,40 @@ class SpectralLibraryReader(object):
         """
         pass
 
+    @abc.abstractmethod
+    def get_spectrum(self, spec_id, process_peaks=False):
+        """
+        Read the `Spectrum` with the specified identifier from the spectral library file.
+
+        Args:
+            spec_id: The identifier of the `Spectrum` in the spectral library file.
+            process_peaks: Flag whether to process the `Spectrum`'s peaks or not.
+
+        Returns:
+            The `Spectrum` from the spectral library file with the specified identifier.
+        """
+        pass
+
+    @abc.abstractmethod
+    def get_spectra(self, spec_ids, process_peaks=False):
+        """
+        Read multiple Spectra with the specified identifiers from the spectral library file.
+
+        Args:
+            spec_ids: The identifiers of the Spectra in the spectral library file.
+            process_peaks: Flag whether to process the Spectra's peaks or not.
+
+        Returns:
+            The Spectra from the spectral library file with the specified identifiers.
+        """
+        pass
+
 
 @six.add_metaclass(abc.ABCMeta)
 class SpectraSTReader(SpectralLibraryReader):
     """
     Read spectra from a SpectraST spectral library file.
     """
-
-    _max_cache_size = None
 
     _supported_extensions = []
 
@@ -240,7 +268,10 @@ class SpectraSTReader(SpectralLibraryReader):
 
         logging.info('Finished creating the spectral library configuration')
 
-    @lru_cache(maxsize=_max_cache_size)
+    @abc.abstractmethod
+    def _get_all_spectra(self):
+        pass
+
     def get_spectrum(self, spec_id, process_peaks=False):
         """
         Read the `Spectrum` with the specified identifier from the spectral library file.
@@ -252,13 +283,49 @@ class SpectraSTReader(SpectralLibraryReader):
         Returns:
             The `Spectrum` from the spectral library file with the specified identifier.
         """
-        self._mm.seek(self.spec_info['offset'][spec_id])
+        spec_id = int(spec_id)
+        key = (spec_id, process_peaks)
+        if key in self._cache:
+            read_spectrum = self._cache[key]
+        else:
+            self._mm.seek(self.spec_info['offset'][spec_id])
 
-        read_spectrum = self._read_spectrum()[0]
-        if process_peaks:
-            read_spectrum.process_peaks()
+            read_spectrum = self._read_spectrum()[0]
+            if process_peaks:
+                read_spectrum.process_peaks()
+
+            self._cache[(read_spectrum.identifier, process_peaks)] = read_spectrum
 
         return read_spectrum
+
+    def get_spectra(self, spec_ids, process_peaks=False):
+        """
+        Read multiple Spectra with the specified identifiers from the spectral library file.
+
+        Args:
+            spec_ids: The identifiers of the Spectra in the spectral library file.
+            process_peaks: Flag whether to process the Spectra's peaks or not.
+
+        Returns:
+            The Spectra from the spectral library file with the specified identifiers.
+        """
+        spectra = []
+
+        # check if some of the required spectra were retrieved previously
+        query_ids = []
+        for spec_id in spec_ids.tolist():  # convert the ids from NumPy types to standard ints -> mandatory for SQLite querying
+            key = (spec_id, process_peaks)
+            if key in self._cache:
+                spectra.append(self._cache[key])
+            else:
+                query_ids.append(spec_id)
+
+        # retrieve the uncached spectra
+        if len(query_ids) > 0:
+            for spec_id in query_ids:
+                spectra.append(self.get_spectrum(spec_id, process_peaks))   # caching is taken care of in this call
+
+        return spectra
 
 
 class SptxtReader(SpectraSTReader):
@@ -399,8 +466,6 @@ class SqliteSpecReader(SpectralLibraryReader):
     Read spectra from a custom SQLite spectral library file.
     """
 
-    _max_cache_size = None
-
     _supported_extensions = ['.spql']
 
     def __enter__(self):
@@ -464,7 +529,6 @@ class SqliteSpecReader(SpectralLibraryReader):
 
             yield read_spectrum, ()
 
-    @lru_cache(maxsize=_max_cache_size)
     def get_spectrum(self, spec_id, process_peaks=False):
         """
         Read the `Spectrum` with the specified identifier from the spectral library file.
@@ -476,21 +540,70 @@ class SqliteSpecReader(SpectralLibraryReader):
         Returns:
             The `Spectrum` from the spectral library file with the specified identifier.
         """
-        cursor = self._conn.cursor()
+        spec_id = int(spec_id)
+        key = (spec_id, process_peaks)
+        if key in self._cache:
+            read_spectrum = self._cache[key]
+        else:
+            cursor = self._conn.cursor()
 
-        # retrieve the specified spectrum
-        cursor.execute('SELECT peptideSeq, precursorMZ, precursorCharge, isDecoy, peakMZ, peakIntensity '
-                       'FROM RefSpectra, RefSpectraPeaks '
-                       'WHERE RefSpectra.id == ? AND RefSpectra.id == RefSpectraPeaks.RefSpectraID', (int(spec_id),))
-        peptide, precursor_mz, precursor_charge, is_decoy, masses, intensities = cursor.fetchone()
+            # retrieve the specified spectrum
+            cursor.execute('SELECT peptideSeq, precursorMZ, precursorCharge, isDecoy, peakMZ, peakIntensity '
+                           'FROM RefSpectra, RefSpectraPeaks '
+                           'WHERE RefSpectra.id == ? AND RefSpectra.id == RefSpectraPeaks.RefSpectraID', (spec_id,))
+            peptide, precursor_mz, precursor_charge, is_decoy, masses, intensities = cursor.fetchone()
 
-        read_spectrum = spectrum.Spectrum(spec_id, precursor_mz, precursor_charge, None, peptide, is_decoy == 1)
-        read_spectrum.set_peaks(masses, intensities)
+            read_spectrum = spectrum.Spectrum(spec_id, precursor_mz, precursor_charge, None, peptide, is_decoy == 1)
+            read_spectrum.set_peaks(masses, intensities)
 
-        if process_peaks:
-            read_spectrum.process_peaks()
+            if process_peaks:
+                read_spectrum.process_peaks()
+
+            self._cache[(read_spectrum.identifier, process_peaks)] = read_spectrum
 
         return read_spectrum
+
+    def get_spectra(self, spec_ids, process_peaks=False):
+        """
+        Read multiple Spectra with the specified identifiers from the spectral library file.
+
+        Args:
+            spec_ids: The identifiers of the Spectra in the spectral library file.
+            process_peaks: Flag whether to process the Spectra's peaks or not.
+
+        Returns:
+            The Spectra from the spectral library file with the specified identifiers.
+        """
+        spectra = []
+
+        # check if some of the required spectra were retrieved previously
+        query_ids = []
+        for spec_id in spec_ids.tolist():   # convert the ids from NumPy types to standard ints -> mandatory for SQLite querying
+            key = (spec_id, process_peaks)
+            if key in self._cache:
+                spectra.append(self._cache[key])
+            else:
+                query_ids.append(spec_id)
+
+        # retrieve the uncached spectra
+        if len(query_ids) > 0:
+            cursor = self._conn.cursor()
+
+            cursor.execute('SELECT id, peptideSeq, precursorMZ, precursorCharge, isDecoy, peakMZ, peakIntensity '
+                           'FROM RefSpectra, RefSpectraPeaks '
+                           'WHERE RefSpectra.id IN ({}) AND RefSpectra.id == RefSpectraPeaks.RefSpectraID'.format(','.join(['?'] * len(query_ids))), query_ids)
+
+            for i, pep, mz, charge, is_decoy, masses, intensities in cursor.fetchall():
+                read_spectrum = spectrum.Spectrum(i, mz, charge, None, pep, is_decoy == 1)
+                read_spectrum.set_peaks(masses, intensities)
+
+                if process_peaks:
+                    read_spectrum.process_peaks()
+
+                spectra.append(read_spectrum)
+                self._cache[(read_spectrum.identifier, process_peaks)] = read_spectrum
+
+        return spectra
 
 
 def read_mgf(filename):

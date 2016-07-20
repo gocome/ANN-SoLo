@@ -209,13 +209,8 @@ class SpectralLibraryBf(SpectralLibrary):
         candidate_idx = self._get_mass_filter_idx(query.precursor_mz, query.precursor_charge, tol_mass, tol_mode)
 
         # read the candidates
-
-        candidates = []
         with self._library_reader as lib_reader:
-            for idx in candidate_idx:
-                candidate = lib_reader.get_spectrum(idx, True)
-                if candidate.is_valid():
-                    candidates.append(candidate)
+            candidates = [cand for cand in lib_reader.get_spectra(candidate_idx, True) if cand.is_valid()]
 
         return candidates
 
@@ -340,11 +335,7 @@ class SpectralLibraryAnn(SpectralLibrary):
             candidate_idx = mass_filter
 
         # read the candidates
-        candidates = []
         with self._library_reader as lib_reader:
-            for idx in candidate_idx:
-                candidate = lib_reader.get_spectrum(idx, True)
-                if candidate.is_valid():
-                    candidates.append(candidate)
+            candidates = [cand for cand in lib_reader.get_spectra(candidate_idx, True) if cand.is_valid()]
 
         return candidates
